@@ -10,7 +10,6 @@ import id.web.izs.sshclient.core.config.SshProfile
 import id.web.izs.sshclient.core.vault.SecretResolver
 import id.web.izs.sshclient.core.vault.VaultCrypto
 import id.web.izs.sshclient.core.vault.VaultState
-import id.web.izs.sshclient.data.local.ConfigDisk
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -61,8 +60,10 @@ sealed interface AutoSyncOutcome {
     data object Conflict : AutoSyncOutcome
 }
 
+class SyncConflictException : IllegalStateException("Config changed during sync; review both copies before retrying")
+
 class SyncRepository(
-    private val disk: ConfigDisk,
+    private val disk: SyncStorage,
     private val api: TabbySyncApi = TabbySyncApi(),
 ) {
     @Volatile private var rememberedPassphrase: String? = null
@@ -381,22 +382,26 @@ class SyncRepository(
         token: String,
         configId: Long,
         appVersion: String,
+        expectedLocalHash: String? = null,
+        expectedRemoteStamp: String? = null,
     ): String = withContext(Dispatchers.IO) {
         val host = RawConfigStore.normalizeHost(hostRaw)
-        val yamlStr = disk.loadYaml() ?: throw IllegalStateException("No local config to upload")
+        val yamlStr = disk.withSyncStateLock {
+            val yaml = disk.loadYaml() ?: throw IllegalStateException("No local config to upload")
+            if (expectedLocalHash != null && syncContentHash(yaml) != expectedLocalHash) syncConflict()
+            yaml
+        }
         val localRaw = RawConfigStore.loadRaw(yamlStr)
         val parts = readParts(localRaw)
-        // Fetch remote for the parts-merge (when any part is disabled)
-        val remoteRaw = try {
-            val remote = api.getConfig(host, token, configId)
-            if (remote.content.isBlank()) null
-            else RawConfigStore.loadRaw(remote.content)
-        } catch (e: Exception) {
-            // New/empty remote (createNewConfig result): no merge
-            null
-        }
+        // A failed read is not an empty config: never upload without the merge source.
+        val remote = api.getConfig(host, token, configId)
+        if (expectedRemoteStamp != null && remote.modifiedAt != expectedRemoteStamp) syncConflict()
+        val remoteRaw = RawConfigStore.parseSync(remote.content, allowBlank = true)
         val uploadDoc = RawConfigStore.buildUploadDoc(localRaw, remoteRaw, parts)
         val content = RawConfigStore.dumpRaw(uploadDoc)
+        // Reject invalid combinations too (e.g. an encrypted shell with its vault excluded).
+        val expectedDocument = RawConfigStore.parseSync(content)
+        disk.withSyncStateLock { requireUnchangedYaml(yamlStr) }
         api.updateConfig(host, token, configId, content, appVersion)
         // Desktop setConfig parity: uploadAndSync calls setConfig(cfg) BEFORE
         // upload(), so uploading to a different cloud config moves the local
@@ -404,18 +409,32 @@ class SyncRepository(
         // with the new stamp (spurious download / missed change). Host/token
         // already live in YAML (written by "Test and save"); only the ID
         // moves here, and only across IDs — same-ID re-upload is a no-op.
-        val cur = RawConfigStore.syncTargetOf(localRaw)
-        if (cur.configId != configId) {
-            RawConfigStore.setSyncTarget(
-                localRaw,
-                RawConfigStore.RawSyncTarget(cur.host, cur.token, configId),
-            )
-            disk.saveYaml(RawConfigStore.dumpRaw(localRaw))
-        }
-        // Refresh the stamp so autosync does not treat this as a new change.
+        // A later writer may have changed the server after PATCH. Do not baseline its content as ours.
         val meta = api.getConfig(host, token, configId)
-        disk.lastRemoteChange = meta.modifiedAt
-        stampSynced()
+        // The server's DRF text field strips surrounding whitespace. Compare
+        // complete parsed documents so harmless YAML formatting is accepted,
+        // while changed scalar values, unknown fields and vault data still
+        // fail verification. Trimming both strings could hide scalar changes.
+        val storedDocument = try {
+            RawConfigStore.parseSync(meta.content)
+        } catch (_: Exception) {
+            syncConflict()
+        }
+        if (storedDocument != expectedDocument) syncConflict()
+        disk.withSyncStateLock {
+            requireUnchangedYaml(yamlStr)
+            val cur = RawConfigStore.syncTargetOf(localRaw)
+            val syncedYaml = if (cur.configId != configId) {
+                RawConfigStore.setSyncTarget(
+                    localRaw,
+                    RawConfigStore.RawSyncTarget(cur.host, cur.token, configId),
+                )
+                RawConfigStore.dumpRaw(localRaw).also { disk.saveYaml(it) }
+            } else yamlStr
+            disk.lastRemoteChange = meta.modifiedAt
+            disk.lastSyncedHash = syncContentHash(syncedYaml)
+            disk.syncConflict = false
+        }
         meta.modifiedAt
     }
 
@@ -442,12 +461,18 @@ class SyncRepository(
         hostRaw: String,
         token: String,
         configId: Long,
+        expectedLocalHash: String? = null,
     ): Loaded = withContext(Dispatchers.IO) {
         val host = RawConfigStore.normalizeHost(hostRaw)
+        // Capture BEFORE HTTP, so edits made while waiting can never be overwritten.
+        val localYaml = disk.withSyncStateLock {
+            disk.loadYaml().also {
+                if (expectedLocalHash != null && syncContentHash(it ?: "") != expectedLocalHash) syncConflict()
+            }
+        }
         val remote = api.getConfig(host, token, configId)
         require(remote.content.isNotBlank()) { "Remote config is empty (no YAML content)" }
-        val remoteRaw = RawConfigStore.loadRaw(remote.content)
-        val localYaml = disk.loadYaml()
+        val remoteRaw = RawConfigStore.parseSync(remote.content)
         val localRaw: LinkedHashMap<String, Any?> = if (localYaml.isNullOrBlank()) {
             LinkedHashMap<String, Any?>(
                 mapOf(RawConfigStore.KEY_CONFIG_SYNC to LinkedHashMap<String, Any?>()),
@@ -457,31 +482,35 @@ class SyncRepository(
         }
         val parts = readParts(localRaw)
         val merged = RawConfigStore.mergeDownload(remoteRaw, localRaw, parts)
-        // Snapshot the PRE-download target first (abort restores it): the
-        // merged doc below retargets at the cloud config.
-        val preTarget = RawConfigStore.syncTargetOf(localRaw)
-        preImportSyncTarget = SyncTarget(preTarget.host, preTarget.token, preTarget.configId, disk.lastRemoteChange)
-        // Disk-persisted twin of the RAM snapshot (beta-blockers #2/#3):
-        // abort must survive process death, and autosync ticks (which funnel
-        // through here) need an undo even when unlocked. Skipped while a
-        // previous fresh shell still awaits its first unlock, so a chained
-        // overwrite can't orphan the original — abort then restores the
-        // oldest generation.
-        if (!pendingEncryptedRewrite && !localYaml.isNullOrBlank()) {
-            disk.savePreImport(localYaml, disk.lastRemoteChange)
+        disk.withSyncStateLock {
+            requireUnchangedYaml(localYaml)
+            // Snapshot the PRE-download target first (abort restores it): the
+            // merged doc below retargets at the cloud config.
+            val preTarget = RawConfigStore.syncTargetOf(localRaw)
+            preImportSyncTarget = SyncTarget(preTarget.host, preTarget.token, preTarget.configId, disk.lastRemoteChange)
+            // Disk-persisted twin of the RAM snapshot (beta-blockers #2/#3):
+            // abort must survive process death, and autosync ticks (which funnel
+            // through here) need an undo even when unlocked. Skipped while a
+            // previous fresh shell still awaits its first unlock, so a chained
+            // overwrite can't orphan the original — abort then restores the
+            // oldest generation.
+            if (!pendingEncryptedRewrite && !localYaml.isNullOrBlank()) {
+                disk.savePreImport(localYaml, disk.lastRemoteChange)
+            }
+            // Make sure the local configSync points at the freshly downloaded config
+            // (detached-copy write-back lives inside retargetSyncSection).
+            RawConfigStore.retargetSyncSection(merged, host, token, configId)
+            // Snapshot for abortPendingImport(): cancelling before the first
+            // unlock must just fail the import (restore this), not erase local.
+            preImportBackupYaml = localYaml
+            preImportPassphrase = rememberedPassphrase
+            disk.saveYaml(RawConfigStore.dumpRaw(merged))
+            val loaded = maybeReencryptFreshShell(merged)
+            stampSynced()
+            disk.lastRemoteChange = remote.modifiedAt
+            disk.syncConflict = false
+            loaded
         }
-        // Make sure the local configSync points at the freshly downloaded config
-        // (detached-copy write-back lives inside retargetSyncSection).
-        RawConfigStore.retargetSyncSection(merged, host, token, configId)
-        disk.lastRemoteChange = remote.modifiedAt
-        // Snapshot for abortPendingImport(): cancelling before the first
-        // unlock must just fail the import (restore this), not erase local.
-        preImportBackupYaml = localYaml
-        preImportPassphrase = rememberedPassphrase
-        disk.saveYaml(RawConfigStore.dumpRaw(merged))
-        val loaded = maybeReencryptFreshShell(merged)
-        stampSynced()
-        loaded
     }
 
     /**
@@ -600,8 +629,12 @@ class SyncRepository(
      * target is configured; a cheap local hash decides the local bit.
      */
     suspend fun autoSyncTick(): AutoSyncOutcome = withContext(Dispatchers.IO) {
-        if (!disk.auto) return@withContext AutoSyncOutcome.Clean
-        val localYaml = disk.loadYaml()
+        // A persisted conflict requires an explicit upload/download decision.
+        // Do not poll, notify again, or resume transfers while it is unresolved.
+        if (!disk.auto || disk.syncConflict) return@withContext AutoSyncOutcome.Clean
+        val (localYaml, baselineStamp, baselineHash) = disk.withSyncStateLock {
+            Triple(disk.loadYaml(), disk.lastRemoteChange, disk.lastSyncedHash)
+        }
         if (localYaml.isNullOrBlank()) return@withContext AutoSyncOutcome.Clean
         val localRaw = RawConfigStore.loadRaw(localYaml)
         // Target from YAML (single source, readable while locked).
@@ -617,24 +650,27 @@ class SyncRepository(
             return@withContext AutoSyncOutcome.Clean
         }
         val sel = list.find { it.id == id } ?: return@withContext AutoSyncOutcome.Clean
-        val remoteDirty = sel.modifiedAt.isNotBlank() && sel.modifiedAt != disk.lastRemoteChange
-        val localDirty = syncContentHash(localYaml) != disk.lastSyncedHash
-        when (decideAutoSync(localDirty, remoteDirty)) {
-            AutoSyncAction.CLEAN -> AutoSyncOutcome.Clean
-            AutoSyncAction.DOWNLOAD -> {
-                downloadIntoLocal(host, token, id)
-                disk.syncConflict = false
-                AutoSyncOutcome.Downloaded(sel.name)
+        val localHash = syncContentHash(localYaml)
+        val remoteDirty = sel.modifiedAt.isNotBlank() && sel.modifiedAt != baselineStamp
+        val localDirty = localHash != baselineHash
+        try {
+            when (decideAutoSync(localDirty, remoteDirty)) {
+                AutoSyncAction.CLEAN -> AutoSyncOutcome.Clean
+                AutoSyncAction.DOWNLOAD -> {
+                    downloadIntoLocal(host, token, id, expectedLocalHash = localHash)
+                    AutoSyncOutcome.Downloaded(sel.name)
+                }
+                AutoSyncAction.UPLOAD -> {
+                    uploadAsCurrent(host, token, id, SYNC_APP_VERSION, localHash, sel.modifiedAt)
+                    AutoSyncOutcome.Uploaded(sel.name)
+                }
+                AutoSyncAction.CONFLICT -> {
+                    disk.syncConflict = true
+                    AutoSyncOutcome.Conflict
+                }
             }
-            AutoSyncAction.UPLOAD -> {
-                uploadAsCurrent(host, token, id, SYNC_APP_VERSION)
-                disk.syncConflict = false
-                AutoSyncOutcome.Uploaded(sel.name)
-            }
-            AutoSyncAction.CONFLICT -> {
-                disk.syncConflict = true
-                AutoSyncOutcome.Conflict
-            }
+        } catch (_: SyncConflictException) {
+            AutoSyncOutcome.Conflict
         }
     }
 
@@ -649,6 +685,16 @@ class SyncRepository(
      */
     private fun stampSynced() {
         disk.lastSyncedHash = syncContentHash(disk.loadYaml() ?: "")
+    }
+
+    private fun syncConflict(): Nothing {
+        disk.syncConflict = true
+        throw SyncConflictException()
+    }
+
+    /** Caller holds the storage lock through the subsequent save and baseline update. */
+    private fun requireUnchangedYaml(expected: String?) {
+        if (disk.loadYaml() != expected) syncConflict()
     }
 
     // ---- vault management (desktop vaultSettingsTab parity) ----
