@@ -220,8 +220,9 @@ fun ConfigSyncScreen(
                         style = MaterialTheme.typography.titleSmall,
                     )
                     Text(
-                        "The server config and this phone's config both changed " +
-                            "since the last sync. Nothing was overwritten — pick which side wins:",
+                        "The configuration changed or could not be verified during sync. " +
+                            "Local changes were kept; an upload may already have reached the server. " +
+                            "Review both copies before choosing which one to keep:",
                         style = MaterialTheme.typography.bodySmall,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

@@ -2,6 +2,7 @@ package id.web.izs.sshclient.data.local
 
 import android.content.Context
 import android.content.SharedPreferences
+import id.web.izs.sshclient.core.sync.SyncStorage
 import id.web.izs.sshclient.core.perf.PerfProbe
 
 /**
@@ -19,7 +20,8 @@ import id.web.izs.sshclient.core.perf.PerfProbe
  * once per process so a transient Keystore glitch can never split-brain
  * reads and writes across the two stores.
  */
-class ConfigDisk(context: Context) {
+class ConfigDisk(context: Context) : SyncStorage {
+    override fun <T> withSyncStateLock(block: () -> T): T = synchronized(syncStateLock, block)
     private val appContext = context.applicationContext
 
     private val plain: SharedPreferences by lazy {
@@ -78,9 +80,11 @@ class ConfigDisk(context: Context) {
         }
     }
 
-    fun loadYaml(): String? = PerfProbe.measure("disk.loadYaml") { prefs().getString(KEY_YAML, null) }
+    override fun loadYaml(): String? = withSyncStateLock {
+        PerfProbe.measure("disk.loadYaml") { prefs().getString(KEY_YAML, null) }
+    }
 
-    fun saveYaml(yaml: String) {
+    override fun saveYaml(yaml: String): Unit = withSyncStateLock {
         PerfProbe.measure("disk.saveYaml") {
             saveYamlMeasured(yaml)
         }
@@ -112,11 +116,11 @@ class ConfigDisk(context: Context) {
      * kept, so restore is repeatable; the next saveYaml rolls normally from
      * the restored content.
      */
-    fun restoreYamlBackup(): String {
+    fun restoreYamlBackup(): String = withSyncStateLock {
         requireEncrypted("config backup restore (holds the sync token, vault blob and possible plaintext secrets)")
         val bak = loadYamlBackup() ?: throw IllegalStateException("No config backup available")
         prefs().edit().putString(KEY_YAML, bak).apply()
-        return bak
+        bak
     }
 
     /**
@@ -126,7 +130,7 @@ class ConfigDisk(context: Context) {
      * config never leaves a stale timestamp or conflict card behind. User
      * prefs (auto/parts) survive; they are settings, not sync state.
      */
-    fun clearYaml() {
+    fun clearYaml(): Unit = withSyncStateLock {
         prefs().edit().remove(KEY_YAML).remove(KEY_YAML_BAK)
             .remove(KEY_YAML_PREIMPORT).remove(KEY_PREIMPORT_STAMP)
             .remove(KEY_LAST_CHANGE).remove(KEY_SYNC_HASH).remove(KEY_SYNC_CONFLICT).apply()
@@ -140,15 +144,15 @@ class ConfigDisk(context: Context) {
      * SyncRepository) or explicit undo. The session passphrase is never
      * stored here (RAM only, like rememberedPassphrase itself).
      */
-    fun savePreImport(yaml: String, lastChange: String) {
+    override fun savePreImport(yaml: String, lastChange: String) {
         requireEncrypted("pre-import snapshot (holds the sync token, vault blob and possible plaintext secrets)")
         prefs().edit().putString(KEY_YAML_PREIMPORT, yaml)
             .putString(KEY_PREIMPORT_STAMP, lastChange).apply()
     }
 
-    fun loadPreImportYaml(): String? = prefs().getString(KEY_YAML_PREIMPORT, null)
+    override fun loadPreImportYaml(): String? = prefs().getString(KEY_YAML_PREIMPORT, null)
 
-    fun loadPreImportStamp(): String = prefs().getString(KEY_PREIMPORT_STAMP, "") ?: ""
+    override fun loadPreImportStamp(): String = prefs().getString(KEY_PREIMPORT_STAMP, "") ?: ""
 
     fun hasPreImport(): Boolean = prefs().contains(KEY_YAML_PREIMPORT)
 
@@ -156,9 +160,9 @@ class ConfigDisk(context: Context) {
         prefs().edit().remove(KEY_YAML_PREIMPORT).remove(KEY_PREIMPORT_STAMP).apply()
     }
 
-    fun loadKnownHostsJson(): String? = prefs().getString(KEY_KNOWN_HOSTS, null)
+    override fun loadKnownHostsJson(): String? = prefs().getString(KEY_KNOWN_HOSTS, null)
 
-    fun saveKnownHostsJson(json: String) {
+    override fun saveKnownHostsJson(json: String) {
         requireEncrypted("known hosts (reveals your infrastructure)")
         prefs().edit().putString(KEY_KNOWN_HOSTS, json).apply()
     }
@@ -166,19 +170,19 @@ class ConfigDisk(context: Context) {
     // ---- sync behavior prefs (non-secret: auto/parts/stamp; the target
     // itself — host/token/configID — lives only in YAML > configSync) ----
 
-    var auto: Boolean
+    override var auto: Boolean
         get() = prefs().getBoolean(KEY_AUTO, false)
         set(v) = prefs().edit().putBoolean(KEY_AUTO, v).apply()
-    var partsHotkeys: Boolean
+    override var partsHotkeys: Boolean
         get() = prefs().getBoolean(KEY_PART_HOTKEYS, true)
         set(v) = prefs().edit().putBoolean(KEY_PART_HOTKEYS, v).apply()
-    var partsAppearance: Boolean
+    override var partsAppearance: Boolean
         get() = prefs().getBoolean(KEY_PART_APPEARANCE, true)
         set(v) = prefs().edit().putBoolean(KEY_PART_APPEARANCE, v).apply()
-    var partsVault: Boolean
+    override var partsVault: Boolean
         get() = prefs().getBoolean(KEY_PART_VAULT, true)
         set(v) = prefs().edit().putBoolean(KEY_PART_VAULT, v).apply()
-    var lastRemoteChange: String
+    override var lastRemoteChange: String
         get() = prefs().getString(KEY_LAST_CHANGE, "") ?: ""
         set(v) = prefs().edit().putString(KEY_LAST_CHANGE, v).apply()
     /**
@@ -188,7 +192,7 @@ class ConfigDisk(context: Context) {
      * after this update, so the first tick backfills local content upward
      * (or raises a conflict when the server moved too). Non-secret.
      */
-    var lastSyncedHash: String
+    override var lastSyncedHash: String
         get() = prefs().getString(KEY_SYNC_HASH, "") ?: ""
         set(v) = prefs().edit().putString(KEY_SYNC_HASH, v).apply()
     /**
@@ -197,7 +201,7 @@ class ConfigDisk(context: Context) {
      * up/download (auto or manual). Drives the toast + sync-screen card +
      * settings dot; never blocks reads or connects.
      */
-    var syncConflict: Boolean
+    override var syncConflict: Boolean
         get() = prefs().getBoolean(KEY_SYNC_CONFLICT, false)
         set(v) = prefs().edit().putBoolean(KEY_SYNC_CONFLICT, v).apply()
 
@@ -209,7 +213,7 @@ class ConfigDisk(context: Context) {
      * (Deliberately NOT gated on the config `version`: that key is
      * desktop-owned parity and must never carry app-local state.)
      */
-    fun dropLegacySyncTarget() {
+    override fun dropLegacySyncTarget() {
         val p = prefs()
         if (!p.contains(KEY_HOST) && !p.contains(KEY_TOKEN) && !p.contains(KEY_CONFIG_ID)) return
         p.edit().remove(KEY_HOST).remove(KEY_TOKEN).remove(KEY_CONFIG_ID).apply()
@@ -446,6 +450,8 @@ class ConfigDisk(context: Context) {
         set(v) = prefs().edit().putBoolean(KEY_NOTIF_ASKED, v).apply()
 
     companion object {
+        // Activity and service instances share the same persisted YAML within this process.
+        private val syncStateLock = Any()
         const val KEY_YAML = "tabby-config-yaml"
         /** Desktop config.yaml.backup parity: previous YAML generation. */
         const val KEY_YAML_BAK = "tabby-config-yaml.bak"

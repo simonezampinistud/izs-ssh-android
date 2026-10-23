@@ -6,7 +6,9 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import id.web.izs.sshclient.core.perf.PerfProbe
 import org.yaml.snakeyaml.DumperOptions
+import org.yaml.snakeyaml.LoaderOptions
 import org.yaml.snakeyaml.Yaml
+import org.yaml.snakeyaml.constructor.SafeConstructor
 
 /**
  * The Raw layer — parity with desktop readConfigDataForSync / writeConfigDataFromSync.
@@ -66,6 +68,35 @@ object RawConfigStore {
 
     fun dumpRaw(doc: Map<String, Any?>): String =
         PerfProbe.measure("yaml.dump") { yaml().dump(doc) }
+
+    /** Validate network input before it can replace local data or participate in an upload. */
+    fun parseSync(text: String, allowBlank: Boolean = false): LinkedHashMap<String, Any?> {
+        if (allowBlank && text.isBlank()) return linkedMapOf()
+        val loaded = try {
+            val options = LoaderOptions().apply { isAllowDuplicateKeys = false }
+            Yaml(SafeConstructor(options)).load<Any>(text)
+        } catch (_: Exception) {
+            // Parser diagnostics can include YAML containing secrets. Keep the UI message generic.
+            throw IllegalArgumentException("Invalid YAML from sync server")
+        }
+        require(loaded is Map<*, *> && loaded.keys.all { it is String }) {
+            "Invalid sync config (top level must be a mapping)"
+        }
+        val doc = loaded.asMutableStringMap()!!
+        require(!doc.containsKey(KEY_PROFILES) || doc[KEY_PROFILES] is List<*>) {
+            "Invalid sync config ('profiles' must be a list)"
+        }
+        require(!doc.containsKey(KEY_ENCRYPTED) || doc[KEY_ENCRYPTED] is Boolean) {
+            "Invalid sync config ('encrypted' must be a boolean)"
+        }
+        if (isEncrypted(doc) || doc[KEY_VAULT] != null) {
+            val vault = doc[KEY_VAULT] as? Map<*, *>
+            require(vault != null && listOf("contents", "keySalt", "iv").all {
+                (vault[it] as? String)?.isNotBlank() == true
+            }) { "Invalid sync config (incomplete vault envelope)" }
+        }
+        return doc
+    }
 
     /**
      * Strict parse for Settings > Config file > Import (pasted full YAML).
@@ -600,11 +631,10 @@ object RawConfigStore {
     ): LinkedHashMap<String, Any?> {
         val doc = LinkedHashMap<String, Any?>(localRaw)
         doc.remove(KEY_CONFIG_SYNC)
-        if (remoteRaw != null) {
-            for (part in OPTIONAL_PARTS) {
-                if (parts[part] == false && remoteRaw.containsKey(part)) {
-                    doc[part] = remoteRaw[part]
-                }
+        for (part in OPTIONAL_PARTS) {
+            if (parts[part] == false) {
+                if (remoteRaw?.containsKey(part) == true) doc[part] = remoteRaw[part]
+                else doc.remove(part)
             }
         }
         return doc
